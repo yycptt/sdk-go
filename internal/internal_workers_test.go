@@ -35,6 +35,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/query/v1"
 	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -342,6 +343,178 @@ func (s *WorkersTestSuite) TestLongRunningWorkflowTask() {
 
 	s.True(isWorkflowCompleted)
 	s.Equal(2, localActivityCalledCount)
+}
+
+func (s *WorkersTestSuite) TestQueryTask_WorkflowCacheEvicted() {
+	ns := "testDomain"
+	taskQueue := "query-task-cache-evicted-tl"
+	workflowType := "query-task-cache-evicted-workflow"
+	workflowID := "query-task-cache-evicted-workflow-id"
+	runID := "query-task-cache-evicted-workflow-run-id"
+	activityType := "query-task-cache-evicted-activity"
+	queryType := "state"
+	doneCh := make(chan struct{})
+
+	activityFn := func(ctx context.Context) error {
+		return nil
+	}
+
+	queryWorkflowFn := func(ctx Context) error {
+		queryResult := "started"
+		// setup query handler for query type "state"
+		if err := SetQueryHandler(ctx, queryType, func(input []byte) (string, error) {
+			return queryResult, nil
+		}); err != nil {
+			return err
+		}
+
+		queryResult = "waiting on timer"
+		NewTimer(ctx, time.Minute*2).Get(ctx, nil)
+
+		queryResult = "waiting on activity"
+		ctx = WithActivityOptions(ctx, ActivityOptions{
+			ScheduleToStartTimeout: 10 * time.Second,
+			StartToCloseTimeout:    10 * time.Second,
+		})
+		if err := ExecuteActivity(ctx, activityFn).Get(ctx, nil); err != nil {
+			return err
+		}
+		queryResult = "done"
+		return nil
+	}
+
+	testEvents := []*historypb.HistoryEvent{
+		{
+			EventId:   1,
+			EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+			Attributes: &historypb.HistoryEvent_WorkflowExecutionStartedEventAttributes{WorkflowExecutionStartedEventAttributes: &historypb.WorkflowExecutionStartedEventAttributes{
+				TaskQueue:                &taskqueuepb.TaskQueue{Name: taskQueue},
+				WorkflowExecutionTimeout: common.DurationPtr(180 * time.Second),
+				WorkflowRunTimeout:       common.DurationPtr(180 * time.Second),
+				WorkflowTaskTimeout:      common.DurationPtr(2 * time.Second),
+				WorkflowType:             &commonpb.WorkflowType{Name: workflowType},
+			}},
+		},
+		createTestEventWorkflowTaskScheduled(2, &historypb.WorkflowTaskScheduledEventAttributes{TaskQueue: &taskqueuepb.TaskQueue{Name: taskQueue}}),
+		createTestEventWorkflowTaskStarted(3),
+		createTestEventWorkflowTaskCompleted(4, &historypb.WorkflowTaskCompletedEventAttributes{ScheduledEventId: 2}),
+		{
+			EventId:   5,
+			EventType: enumspb.EVENT_TYPE_TIMER_STARTED,
+			Attributes: &historypb.HistoryEvent_TimerStartedEventAttributes{TimerStartedEventAttributes: &historypb.TimerStartedEventAttributes{
+				TimerId:                      "5",
+				StartToFireTimeout:           common.DurationPtr(120 * time.Second),
+				WorkflowTaskCompletedEventId: 4,
+			}},
+		},
+		{
+			EventId:   6,
+			EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
+			Attributes: &historypb.HistoryEvent_TimerFiredEventAttributes{TimerFiredEventAttributes: &historypb.TimerFiredEventAttributes{
+				TimerId:        "5",
+				StartedEventId: 5,
+			}},
+		},
+		createTestEventWorkflowTaskScheduled(7, &historypb.WorkflowTaskScheduledEventAttributes{TaskQueue: &taskqueuepb.TaskQueue{Name: taskQueue}}),
+		createTestEventWorkflowTaskStarted(8),
+		createTestEventWorkflowTaskCompleted(9, &historypb.WorkflowTaskCompletedEventAttributes{ScheduledEventId: 7}),
+		createTestEventActivityTaskScheduled(10, &historypb.ActivityTaskScheduledEventAttributes{
+			ActivityId: "10",
+			ActivityType: &commonpb.ActivityType{
+				Name: activityType,
+			},
+			Namespace:                    ns,
+			TaskQueue:                    &taskqueuepb.TaskQueue{Name: taskQueue},
+			ScheduleToStartTimeout:       common.DurationPtr(10 * time.Second),
+			StartToCloseTimeout:          common.DurationPtr(10 * time.Second),
+			WorkflowTaskCompletedEventId: 9,
+		}),
+	}
+
+	s.service.EXPECT().DescribeNamespace(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	task := &workflowservice.PollWorkflowTaskQueueResponse{
+		TaskToken: []byte("test-token"),
+		WorkflowExecution: &commonpb.WorkflowExecution{
+			WorkflowId: workflowID,
+			RunId:      runID,
+		},
+		WorkflowType: &commonpb.WorkflowType{
+			Name: workflowType,
+		},
+		PreviousStartedEventId: 0,
+		StartedEventId:         3,
+		History:                &historypb.History{Events: testEvents[0:3]},
+		NextPageToken:          nil,
+		// NextEventId:            common.Int64Ptr(4),
+	}
+	s.service.EXPECT().PollWorkflowTaskQueue(gomock.Any(), gomock.Any(), gomock.Any()).Return(task, nil).Times(1)
+	s.service.EXPECT().RespondWorkflowTaskCompleted(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, request *workflowservice.RespondWorkflowTaskCompletedRequest, opts ...grpc.CallOption,
+	) (success *workflowservice.RespondWorkflowTaskCompletedResponse, err error) {
+		s.Equal(1, len(request.Commands))
+		s.Equal(enumspb.COMMAND_TYPE_START_TIMER, request.Commands[0].GetCommandType())
+		return &workflowservice.RespondWorkflowTaskCompletedResponse{}, nil
+	}).Times(1)
+	queryTask := &workflowservice.PollWorkflowTaskQueueResponse{
+		TaskToken: []byte("test-token"),
+		WorkflowExecution: &commonpb.WorkflowExecution{
+			WorkflowId: workflowID,
+			RunId:      runID,
+		},
+		WorkflowType: &commonpb.WorkflowType{
+			Name: workflowType,
+		},
+		PreviousStartedEventId: 3,
+		History:                &historypb.History{}, // sticky query, so there's no history
+		NextPageToken:          nil,
+		// NextEventId:            5,
+		Query: &query.WorkflowQuery{
+			QueryType: queryType,
+		},
+	}
+
+	clientOptions := ClientOptions{
+		Identity: "test-worker-identity",
+	}
+
+	client := NewServiceClient(s.service, nil, clientOptions)
+	worker := NewAggregatedWorker(client, taskQueue, WorkerOptions{
+		LocalActivityWorkerOnly: true,
+	})
+
+	s.service.EXPECT().PollWorkflowTaskQueue(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, request *workflowservice.PollWorkflowTaskQueueRequest, opts ...grpc.CallOption,
+	) (success *workflowservice.PollWorkflowTaskQueueResponse, err error) {
+		worker.workflowWorker.executionParameters.cache.getWorkflowCache().Delete(runID) // force remove the workflow state
+		return queryTask, nil
+	}).Times(1)
+	s.service.EXPECT().ResetStickyTaskQueue(gomock.Any(), gomock.Any(), gomock.Any()).Return(&workflowservice.ResetStickyTaskQueueResponse{}, nil).AnyTimes()
+	s.service.EXPECT().GetWorkflowExecutionHistory(gomock.Any(), gomock.Any(), gomock.Any()).Return(&workflowservice.GetWorkflowExecutionHistoryResponse{
+		History: &historypb.History{Events: testEvents}, // workflow has made progress, return all available events
+	}, nil).Times(1)
+	s.service.EXPECT().RespondQueryTaskCompleted(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, request *workflowservice.RespondQueryTaskCompletedRequest, opts ...grpc.CallOption) error {
+		s.Equal(enumspb.QUERY_RESULT_TYPE_ANSWERED, request.GetCompletedType())
+		// var result string
+		// result1 := ""
+		// result2 := ""
+		// dc := converter.GetDefaultDataConverter()
+		// dc.FromPayloads(request.GetQueryResult(), &result1, &result2)
+		close(doneCh)
+		return nil
+	}).Times(1)
+	s.service.EXPECT().PollWorkflowTaskQueue(gomock.Any(), gomock.Any(), gomock.Any()).Return(&workflowservice.PollWorkflowTaskQueueResponse{}, &serviceerror.Internal{}).AnyTimes()
+
+	worker.RegisterWorkflowWithOptions(
+		queryWorkflowFn,
+		RegisterWorkflowOptions{Name: workflowType},
+	)
+	worker.RegisterActivityWithOptions(
+		activityFn,
+		RegisterActivityOptions{Name: activityType},
+	)
+
+	worker.Start()
+	<-doneCh
+	worker.Stop()
+
 }
 
 func (s *WorkersTestSuite) TestMultipleLocalActivities() {

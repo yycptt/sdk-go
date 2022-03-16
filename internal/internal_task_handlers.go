@@ -200,6 +200,8 @@ func (eh *history) GetWorkflowStartedEvent() (*historypb.HistoryEvent, error) {
 }
 
 func (eh *history) IsReplayEvent(event *historypb.HistoryEvent) bool {
+	// potential fix?
+	// return eh.workflowTask.task.GetQuery() != nil || event.GetEventId() <= eh.workflowTask.task.GetPreviousStartedEventId() || isCommandEvent(event.GetEventType())
 	return event.GetEventId() <= eh.workflowTask.task.GetPreviousStartedEventId() || isCommandEvent(event.GetEventType())
 }
 
